@@ -1,4 +1,4 @@
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import * as work from 'webworkify-webpack';
 
 import Event from '../events';
@@ -12,7 +12,7 @@ import { Observer } from '../observer';
 
 // see https://stackoverflow.com/a/11237259/589493
 const global = getSelfScope(); // safeguard for code that might run both on worker and main thread
-const MediaSource = getMediaSource();
+const MediaSource = getMediaSource() || { isTypeSupported: () => false };
 
 class Demuxer {
   constructor (hls, id) {
@@ -95,7 +95,7 @@ class Demuxer {
 
   push (data, initSegment, audioCodec, videoCodec, frag, duration, accurateTimeOffset, defaultInitPTS) {
     const w = this.w;
-    const timeOffset = Number.isFinite(frag.startDTS) ? frag.startDTS : frag.start;
+    const timeOffset = Number.isFinite(frag.startPTS) ? frag.startPTS : frag.start;
     const decryptdata = frag.decryptdata;
     const lastFrag = this.frag;
     const discontinuity = !(lastFrag && (frag.cc === lastFrag.cc));

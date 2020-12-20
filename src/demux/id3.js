@@ -1,3 +1,5 @@
+import { getSelfScope } from '../utils/get-self-scope';
+
 /**
  * ID3 parser
  */
@@ -182,13 +184,11 @@ class ID3 {
   static _decodeFrame (frame) {
     if (frame.type === 'PRIV') {
       return ID3._decodePrivFrame(frame);
-    } else if (frame.type[0] === 'T') {
-      return ID3._decodeTextFrame(frame);
     } else if (frame.type[0] === 'W') {
       return ID3._decodeURLFrame(frame);
     }
 
-    return undefined;
+    return ID3._decodeTextFrame(frame);
   }
 
   static _readTimeStamp (timeStampFrame) {
@@ -239,7 +239,7 @@ class ID3 {
       [1-?] = {Description}\0{Value}
       */
       let index = 1;
-      const description = ID3._utf8ArrayToStr(frame.data.subarray(index));
+      const description = ID3._utf8ArrayToStr(frame.data.subarray(index), true);
 
       index += description.length + 1;
       const value = ID3._utf8ArrayToStr(frame.data.subarray(index));
@@ -268,7 +268,7 @@ class ID3 {
       }
 
       let index = 1;
-      const description = ID3._utf8ArrayToStr(frame.data.subarray(index));
+      const description = ID3._utf8ArrayToStr(frame.data.subarray(index), true);
 
       index += description.length + 1;
       const value = ID3._utf8ArrayToStr(frame.data.subarray(index));
@@ -294,6 +294,20 @@ class ID3 {
    * This library is free.  You can redistribute it and/or modify it.
    */
   static _utf8ArrayToStr (array, exitOnNull = false) {
+    const decoder = getTextDecoder();
+    if (decoder) {
+      const decoded = decoder.decode(array);
+
+      if (exitOnNull) {
+        // grab up to the first null
+        const idx = decoded.indexOf('\0');
+        return idx !== -1 ? decoded.substring(0, idx) : decoded;
+      }
+
+      // remove any null characters
+      return decoded.replace(/\0/g, '');
+    }
+
     const len = array.length;
     let c;
     let char2;
@@ -331,6 +345,17 @@ class ID3 {
     }
     return out;
   }
+}
+
+let decoder;
+
+function getTextDecoder () {
+  const global = getSelfScope(); // safeguard for code that might run both on worker and main thread
+  if (!decoder && typeof global.TextDecoder !== 'undefined') {
+    decoder = new global.TextDecoder('utf-8');
+  }
+
+  return decoder;
 }
 
 const utf8ArrayToStr = ID3._utf8ArrayToStr;

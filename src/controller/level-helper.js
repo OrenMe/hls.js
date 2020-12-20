@@ -46,7 +46,8 @@ export function updatePTS (fragments, fromIdx, toIdx) {
   } else {
     // we dont know startPTS[toIdx]
     if (toIdx > fromIdx) {
-      fragTo.start = fragFrom.start + fragFrom.duration;
+      const contiguous = fragFrom.cc === fragTo.cc;
+      fragTo.start = fragFrom.start + ((contiguous && fragFrom.minEndPTS) ? fragFrom.minEndPTS - fragFrom.start : fragFrom.duration);
     } else {
       fragTo.start = Math.max(fragFrom.start - fragTo.duration, 0);
     }
@@ -56,6 +57,7 @@ export function updatePTS (fragments, fromIdx, toIdx) {
 export function updateFragPTSDTS (details, frag, startPTS, endPTS, startDTS, endDTS) {
   // update frag PTS/DTS
   let maxStartPTS = startPTS;
+  let minEndPTS = endPTS;
   if (Number.isFinite(frag.startPTS)) {
     // delta PTS between audio and video
     let deltaPTS = Math.abs(frag.startPTS - startPTS);
@@ -67,6 +69,7 @@ export function updateFragPTSDTS (details, frag, startPTS, endPTS, startDTS, end
 
     maxStartPTS = Math.max(startPTS, frag.startPTS);
     startPTS = Math.min(startPTS, frag.startPTS);
+    minEndPTS = Math.min(endPTS, frag.endPTS);
     endPTS = Math.max(endPTS, frag.endPTS);
     startDTS = Math.min(startDTS, frag.startDTS);
     endDTS = Math.max(endDTS, frag.endDTS);
@@ -76,6 +79,7 @@ export function updateFragPTSDTS (details, frag, startPTS, endPTS, startDTS, end
   frag.start = frag.startPTS = startPTS;
   frag.maxStartPTS = maxStartPTS;
   frag.endPTS = endPTS;
+  frag.minEndPTS = minEndPTS;
   frag.startDTS = startDTS;
   frag.endDTS = endDTS;
   frag.duration = endPTS - startPTS;
@@ -110,45 +114,38 @@ export function updateFragPTSDTS (details, frag, startPTS, endPTS, startDTS, end
 }
 
 export function mergeDetails (oldDetails, newDetails) {
-  let start = Math.max(oldDetails.startSN, newDetails.startSN) - newDetails.startSN,
-    end = Math.min(oldDetails.endSN, newDetails.endSN) - newDetails.startSN,
-    delta = newDetails.startSN - oldDetails.startSN,
-    oldfragments = oldDetails.fragments,
-    newfragments = newDetails.fragments,
-    ccOffset = 0,
-    PTSFrag;
-
   // potentially retrieve cached initsegment
   if (newDetails.initSegment && oldDetails.initSegment) {
     newDetails.initSegment = oldDetails.initSegment;
   }
 
   // check if old/new playlists have fragments in common
-  if (end < start) {
-    newDetails.PTSKnown = false;
-    return;
-  }
   // loop through overlapping SN and update startPTS , cc, and duration if any found
-  for (var i = start; i <= end; i++) {
-    let oldFrag = oldfragments[delta + i],
-      newFrag = newfragments[i];
-    if (newFrag && oldFrag) {
-      ccOffset = oldFrag.cc - newFrag.cc;
-      if (Number.isFinite(oldFrag.startPTS)) {
-        newFrag.start = newFrag.startPTS = oldFrag.startPTS;
-        newFrag.endPTS = oldFrag.endPTS;
-        newFrag.duration = oldFrag.duration;
-        newFrag.backtracked = oldFrag.backtracked;
-        newFrag.dropped = oldFrag.dropped;
-        PTSFrag = newFrag;
-      }
+  let ccOffset = 0;
+  let PTSFrag;
+  mapFragmentIntersection(oldDetails, newDetails, (oldFrag, newFrag) => {
+    ccOffset = oldFrag.cc - newFrag.cc;
+    if (Number.isFinite(oldFrag.startPTS)) {
+      newFrag.start = newFrag.startPTS = oldFrag.startPTS;
+      newFrag.endPTS = oldFrag.endPTS;
+      newFrag.duration = oldFrag.duration;
+      newFrag.backtracked = oldFrag.backtracked;
+      newFrag.dropped = oldFrag.dropped;
+      PTSFrag = newFrag;
     }
+    // PTS is known when there are overlapping segments
+    newDetails.PTSKnown = true;
+  });
+
+  if (!newDetails.PTSKnown) {
+    return;
   }
 
   if (ccOffset) {
     logger.log('discontinuity sliding from playlist, take drift into account');
-    for (i = 0; i < newfragments.length; i++) {
-      newfragments[i].cc += ccOffset;
+    const newFragments = newDetails.fragments;
+    for (let i = 0; i < newFragments.length; i++) {
+      newFragments[i].cc += ccOffset;
     }
   }
 
@@ -156,18 +153,81 @@ export function mergeDetails (oldDetails, newDetails) {
   if (PTSFrag) {
     updateFragPTSDTS(newDetails, PTSFrag, PTSFrag.startPTS, PTSFrag.endPTS, PTSFrag.startDTS, PTSFrag.endDTS);
   } else {
-    // ensure that delta is within oldfragments range
+    // ensure that delta is within oldFragments range
     // also adjust sliding in case delta is 0 (we could have old=[50-60] and new=old=[50-61])
     // in that case we also need to adjust start offset of all fragments
-    if (delta >= 0 && delta < oldfragments.length) {
-      // adjust start by sliding offset
-      let sliding = oldfragments[delta].start;
-      for (i = 0; i < newfragments.length; i++) {
-        newfragments[i].start += sliding;
-      }
-    }
+    adjustSliding(oldDetails, newDetails);
   }
   // if we are here, it means we have fragments overlapping between
   // old and new level. reliable PTS info is thus relying on old level
   newDetails.PTSKnown = oldDetails.PTSKnown;
+}
+
+export function mergeSubtitlePlaylists (oldPlaylist, newPlaylist, referenceStart = 0) {
+  let lastIndex = -1;
+  mapFragmentIntersection(oldPlaylist, newPlaylist, (oldFrag, newFrag, index) => {
+    newFrag.start = oldFrag.start;
+    lastIndex = index;
+  });
+
+  const frags = newPlaylist.fragments;
+  if (lastIndex < 0) {
+    frags.forEach(frag => {
+      frag.start += referenceStart;
+    });
+    return;
+  }
+
+  for (let i = lastIndex + 1; i < frags.length; i++) {
+    frags[i].start = (frags[i - 1].start + frags[i - 1].duration);
+  }
+}
+
+export function mapFragmentIntersection (oldPlaylist, newPlaylist, intersectionFn) {
+  if (!oldPlaylist || !newPlaylist) {
+    return;
+  }
+
+  const start = Math.max(oldPlaylist.startSN, newPlaylist.startSN) - newPlaylist.startSN;
+  const end = Math.min(oldPlaylist.endSN, newPlaylist.endSN) - newPlaylist.startSN;
+  const delta = newPlaylist.startSN - oldPlaylist.startSN;
+
+  for (let i = start; i <= end; i++) {
+    const oldFrag = oldPlaylist.fragments[delta + i];
+    const newFrag = newPlaylist.fragments[i];
+    if (!oldFrag || !newFrag) {
+      break;
+    }
+    intersectionFn(oldFrag, newFrag, i);
+  }
+}
+
+export function adjustSliding (oldPlaylist, newPlaylist) {
+  const delta = newPlaylist.startSN - oldPlaylist.startSN;
+  const oldFragments = oldPlaylist.fragments;
+  const newFragments = newPlaylist.fragments;
+
+  if (delta < 0 || delta > oldFragments.length) {
+    return;
+  }
+  for (let i = 0; i < newFragments.length; i++) {
+    newFragments[i].start += oldFragments[delta].start;
+  }
+}
+
+export function computeReloadInterval (currentPlaylist, newPlaylist, lastRequestTime) {
+  let reloadInterval = 1000 * (newPlaylist.averagetargetduration ? newPlaylist.averagetargetduration : newPlaylist.targetduration);
+  const minReloadInterval = reloadInterval / 2;
+  if (currentPlaylist && newPlaylist.endSN === currentPlaylist.endSN) {
+    // follow HLS Spec, If the client reloads a Playlist file and finds that it has not
+    // changed then it MUST wait for a period of one-half the target
+    // duration before retrying.
+    reloadInterval = minReloadInterval;
+  }
+
+  if (lastRequestTime) {
+    reloadInterval = Math.max(minReloadInterval, reloadInterval - (window.performance.now() - lastRequestTime));
+  }
+  // in any case, don't reload more than half of target duration
+  return Math.round(reloadInterval);
 }

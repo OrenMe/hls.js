@@ -25,8 +25,8 @@ export class FragmentTracker extends EventHandler {
   }
 
   destroy () {
-    this.fragments = null;
-    this.timeRanges = null;
+    this.fragments = Object.create(null);
+    this.timeRanges = Object.create(null);
     this.config = null;
     EventHandler.prototype.destroy.call(this);
     super.destroy();
@@ -71,23 +71,23 @@ export class FragmentTracker extends EventHandler {
    * @param {TimeRanges} timeRange TimeRange object from a sourceBuffer
    */
   detectEvictedFragments (elementaryStream, timeRange) {
-    let fragmentTimes, time;
     // Check if any flagged fragments have been unloaded
     Object.keys(this.fragments).forEach(key => {
       const fragmentEntity = this.fragments[key];
-      if (fragmentEntity.buffered === true) {
-        const esData = fragmentEntity.range[elementaryStream];
-        if (esData) {
-          fragmentTimes = esData.time;
-          for (let i = 0; i < fragmentTimes.length; i++) {
-            time = fragmentTimes[i];
-
-            if (this.isTimeBuffered(time.startPTS, time.endPTS, timeRange) === false) {
-              // Unregister partial fragment as it needs to load again to be reused
-              this.removeFragment(fragmentEntity.body);
-              break;
-            }
-          }
+      if (!fragmentEntity || !fragmentEntity.buffered) {
+        return;
+      }
+      const esData = fragmentEntity.range[elementaryStream];
+      if (!esData) {
+        return;
+      }
+      const fragmentTimes = esData.time;
+      for (let i = 0; i < fragmentTimes.length; i++) {
+        const time = fragmentTimes[i];
+        if (!this.isTimeBuffered(time.startPTS, time.endPTS, timeRange)) {
+          // Unregister partial fragment as it needs to load again to be reused
+          this.removeFragment(fragmentEntity.body);
+          break;
         }
       }
     });
@@ -234,13 +234,15 @@ export class FragmentTracker extends EventHandler {
     const fragment = e.frag;
     // don't track initsegment (for which sn is not a number)
     // don't track frags used for bitrateTest, they're irrelevant.
-    if (Number.isFinite(fragment.sn) && !fragment.bitrateTest) {
-      this.fragments[this.getFragmentKey(fragment)] = {
-        body: fragment,
-        range: Object.create(null),
-        buffered: false
-      };
+    if (!Number.isFinite(fragment.sn) || fragment.bitrateTest) {
+      return;
     }
+
+    this.fragments[this.getFragmentKey(fragment)] = {
+      body: fragment,
+      range: Object.create(null),
+      buffered: false
+    };
   }
 
   /**

@@ -7,9 +7,9 @@ import EventHandler from '../event-handler';
 import { logger } from '../utils/logger';
 import { ErrorTypes, ErrorDetails } from '../errors';
 import { isCodecSupportedInMp4 } from '../utils/codecs';
-import { addGroupId } from './level-helper';
+import { addGroupId, computeReloadInterval } from './level-helper';
 
-const { performance } = window;
+let chromeOrFirefox;
 
 export default class LevelController extends EventHandler {
   constructor (hls) {
@@ -24,6 +24,8 @@ export default class LevelController extends EventHandler {
     this.currentLevelIndex = null;
     this.manualLevelIndex = -1;
     this.timer = null;
+
+    chromeOrFirefox = /chrome|firefox/.test(navigator.userAgent.toLowerCase());
   }
 
   onHandlerDestroying () {
@@ -48,10 +50,6 @@ export default class LevelController extends EventHandler {
     if (levels) {
       levels.forEach(level => {
         level.loadError = 0;
-        const levelDetails = level.details;
-        if (levelDetails && levelDetails.live) {
-          level.details = undefined;
-        }
       });
     }
     // speed up live playlist refresh if timer exists
@@ -66,21 +64,21 @@ export default class LevelController extends EventHandler {
 
   onManifestLoaded (data) {
     let levels = [];
+    let audioTracks = [];
     let bitrateStart;
     let levelSet = {};
     let levelFromSet = null;
     let videoCodecFound = false;
     let audioCodecFound = false;
-    let chromeOrFirefox = /chrome|firefox/.test(navigator.userAgent.toLowerCase());
-    let audioTracks = [];
 
     // regroup redundant levels together
     data.levels.forEach(level => {
+      const attributes = level.attrs;
       level.loadError = 0;
       level.fragmentError = false;
 
       videoCodecFound = videoCodecFound || !!level.videoCodec;
-      audioCodecFound = audioCodecFound || !!level.audioCodec || !!(level.attrs && level.attrs.AUDIO);
+      audioCodecFound = audioCodecFound || !!level.audioCodec;
 
       // erase audio codec info if browser does not support mp4a.40.34.
       // demuxer will autodetect codec and fallback to mpeg/audio
@@ -99,12 +97,13 @@ export default class LevelController extends EventHandler {
         levelFromSet.url.push(level.url);
       }
 
-      if (level.attrs && level.attrs.AUDIO) {
-        addGroupId(levelFromSet || level, 'audio', level.attrs.AUDIO);
-      }
-
-      if (level.attrs && level.attrs.SUBTITLES) {
-        addGroupId(levelFromSet || level, 'text', level.attrs.SUBTITLES);
+      if (attributes) {
+        if (attributes.AUDIO) {
+          addGroupId(levelFromSet || level, 'audio', attributes.AUDIO);
+        }
+        if (attributes.SUBTITLES) {
+          addGroupId(levelFromSet || level, 'text', attributes.SUBTITLES);
+        }
       }
     });
 
@@ -115,7 +114,7 @@ export default class LevelController extends EventHandler {
 
     // only keep levels with supported audio/video codecs
     levels = levels.filter(({ audioCodec, videoCodec }) => {
-      return (!audioCodec || isCodecSupportedInMp4(audioCodec)) && (!videoCodec || isCodecSupportedInMp4(videoCodec));
+      return (!audioCodec || isCodecSupportedInMp4(audioCodec, 'audio')) && (!videoCodec || isCodecSupportedInMp4(videoCodec, 'video'));
     });
 
     if (data.audioTracks) {
@@ -130,9 +129,7 @@ export default class LevelController extends EventHandler {
       // start bitrate is the first bitrate of the manifest
       bitrateStart = levels[0].bitrate;
       // sort level on bitrate
-      levels.sort(function (a, b) {
-        return a.bitrate - b.bitrate;
-      });
+      levels.sort((a, b) => a.bitrate - b.bitrate);
       this._levels = levels;
       // find index of first level in sorted levels
       for (let i = 0; i < levels.length; i++) {
@@ -142,6 +139,10 @@ export default class LevelController extends EventHandler {
           break;
         }
       }
+
+      // Audio is only alternate if manifest include a URI along with the audio group tag,
+      // and this is not an audio-only stream where levels contain audio-only
+      const audioOnly = audioCodecFound && !videoCodecFound;
       this.hls.trigger(Event.MANIFEST_PARSED, {
         levels,
         audioTracks,
@@ -149,7 +150,7 @@ export default class LevelController extends EventHandler {
         stats: data.stats,
         audio: audioCodecFound,
         video: videoCodecFound,
-        altAudio: audioTracks.length > 0 && videoCodecFound
+        altAudio: !audioOnly && audioTracks.some(t => !!t.url)
       });
     } else {
       this.hls.trigger(Event.ERROR, {
@@ -377,35 +378,21 @@ export default class LevelController extends EventHandler {
   }
 
   onLevelLoaded (data) {
-    const levelId = data.level;
+    const { level, details } = data;
     // only process level loaded events matching with expected level
-    if (levelId !== this.currentLevelIndex) {
+    if (level !== this.currentLevelIndex) {
       return;
     }
 
-    const curLevel = this._levels[levelId];
+    const curLevel = this._levels[level];
     // reset level load error counter on successful level loaded only if there is no issues with fragments
     if (!curLevel.fragmentError) {
       curLevel.loadError = 0;
       this.levelRetryCount = 0;
     }
-    let newDetails = data.details;
     // if current playlist is a live playlist, arm a timer to reload it
-    if (newDetails.live) {
-      const targetdurationMs = 1000 * (newDetails.averagetargetduration ? newDetails.averagetargetduration : newDetails.targetduration);
-      let reloadInterval = targetdurationMs,
-        curDetails = curLevel.details;
-      if (curDetails && newDetails.endSN === curDetails.endSN) {
-        // follow HLS Spec, If the client reloads a Playlist file and finds that it has not
-        // changed then it MUST wait for a period of one-half the target
-        // duration before retrying.
-        reloadInterval /= 2;
-        logger.log('same live playlist, reload twice faster');
-      }
-      // decrement reloadInterval with level loading delay
-      reloadInterval -= performance.now() - data.stats.trequest;
-      // in any case, don't reload more than half of target duration
-      reloadInterval = Math.max(targetdurationMs / 2, Math.round(reloadInterval));
+    if (details.live) {
+      const reloadInterval = computeReloadInterval(curLevel.details, details, data.stats.trequest);
       logger.log(`live playlist, reload in ${Math.round(reloadInterval)} ms`);
       this.timer = setTimeout(() => this.loadLevel(), reloadInterval);
     } else {
@@ -422,7 +409,15 @@ export default class LevelController extends EventHandler {
     }
 
     if (currentLevel.audioGroupIds) {
-      const urlId = currentLevel.audioGroupIds.findIndex((groupId) => groupId === audioGroupId);
+      let urlId = -1;
+
+      for (let i = 0; i < currentLevel.audioGroupIds.length; i++) {
+        if (currentLevel.audioGroupIds[i] === audioGroupId) {
+          urlId = i;
+          break;
+        }
+      }
+
       if (urlId !== currentLevel.urlId) {
         currentLevel.urlId = urlId;
         this.startLoad();
@@ -465,5 +460,32 @@ export default class LevelController extends EventHandler {
     if (this.manualLevelIndex === -1) {
       this.hls.nextAutoLevel = nextLevel;
     }
+  }
+
+  removeLevel (levelIndex, urlId) {
+    const levels = this.levels.filter((level, index) => {
+      if (index !== levelIndex) {
+        return true;
+      }
+
+      if (level.url.length > 1 && urlId !== undefined) {
+        level.url = level.url.filter((url, id) => id !== urlId);
+        level.urlId = 0;
+        return true;
+      }
+      return false;
+    }).map((level, index) => {
+      const { details } = level;
+      if (details && details.fragments) {
+        details.fragments.forEach((fragment) => {
+          fragment.level = index;
+        });
+      }
+      return level;
+    });
+
+    this._levels = levels;
+
+    this.hls.trigger(Event.LEVELS_UPDATED, { levels });
   }
 }

@@ -11,6 +11,7 @@ class CapLevelController extends EventHandler {
       Event.FPS_DROP_LEVEL_CAPPING,
       Event.MEDIA_ATTACHING,
       Event.MANIFEST_PARSED,
+      Event.LEVELS_UPDATED,
       Event.BUFFER_CODECS,
       Event.MEDIA_DETACHING);
 
@@ -20,12 +21,14 @@ class CapLevelController extends EventHandler {
     this.media = null;
     this.restrictedLevels = [];
     this.timer = null;
+    this.clientRect = null;
   }
 
   destroy () {
     if (this.hls.config.capLevelToPlayerSize) {
       this.media = null;
-      this._stopCapping();
+      this.clientRect = null;
+      this.stopCapping();
     }
   }
 
@@ -45,9 +48,9 @@ class CapLevelController extends EventHandler {
     this.restrictedLevels = [];
     this.levels = data.levels;
     this.firstLevel = data.firstLevel;
-    if (hls.config.capLevelToPlayerSize && (data.video || (data.levels.length && data.altAudio))) {
+    if (hls.config.capLevelToPlayerSize && data.video) {
       // Start capping immediately if the manifest has signaled video codecs
-      this._startCapping();
+      this.startCapping();
     }
   }
 
@@ -57,7 +60,7 @@ class CapLevelController extends EventHandler {
     const hls = this.hls;
     if (hls.config.capLevelToPlayerSize && data.video) {
       // If the manifest did not signal a video codec capping has been deferred until we're certain video is present
-      this._startCapping();
+      this.startCapping();
     }
   }
 
@@ -66,7 +69,7 @@ class CapLevelController extends EventHandler {
   }
 
   onMediaDetaching () {
-    this._stopCapping();
+    this.stopCapping();
   }
 
   detectPlayerSize () {
@@ -97,10 +100,11 @@ class CapLevelController extends EventHandler {
       CapLevelController.isLevelAllowed(index, this.restrictedLevels) && index <= capLevelIndex
     );
 
+    this.clientRect = null;
     return CapLevelController.getMaxLevelByMediaSize(validLevels, this.mediaWidth, this.mediaHeight);
   }
 
-  _startCapping () {
+  startCapping () {
     if (this.timer) {
       // Don't reset capping if started twice; this can happen if the manifest signals a video codec
       return;
@@ -112,7 +116,7 @@ class CapLevelController extends EventHandler {
     this.detectPlayerSize();
   }
 
-  _stopCapping () {
+  stopCapping () {
     this.restrictedLevels = [];
     this.firstLevel = null;
     this.autoLevelCapping = Number.POSITIVE_INFINITY;
@@ -122,24 +126,37 @@ class CapLevelController extends EventHandler {
     }
   }
 
-  get mediaWidth () {
-    let width;
-    const media = this.media;
-    if (media) {
-      width = media.width || media.clientWidth || media.offsetWidth;
-      width *= CapLevelController.contentScaleFactor;
+  getDimensions () {
+    if (this.clientRect) {
+      return this.clientRect;
     }
-    return width;
+    const media = this.media;
+    const boundsRect = {
+      width: 0,
+      height: 0
+    };
+
+    if (media) {
+      const clientRect = media.getBoundingClientRect();
+      boundsRect.width = clientRect.width;
+      boundsRect.height = clientRect.height;
+      if (!boundsRect.width && !boundsRect.height) {
+        // When the media element has no width or height (equivalent to not being in the DOM),
+        // then use its width and height attributes (media.width, media.height)
+        boundsRect.width = clientRect.right - clientRect.left || media.width || 0;
+        boundsRect.height = clientRect.bottom - clientRect.top || media.height || 0;
+      }
+    }
+    this.clientRect = boundsRect;
+    return boundsRect;
+  }
+
+  get mediaWidth () {
+    return this.getDimensions().width * CapLevelController.contentScaleFactor;
   }
 
   get mediaHeight () {
-    let height;
-    const media = this.media;
-    if (media) {
-      height = media.height || media.clientHeight || media.offsetHeight;
-      height *= CapLevelController.contentScaleFactor;
-    }
-    return height;
+    return this.getDimensions().height * CapLevelController.contentScaleFactor;
   }
 
   static get contentScaleFactor () {
